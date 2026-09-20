@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the repository. Git for Windows has a
+# system-level core.autocrlf=true, so a checkout on Windows would otherwise
+# turn LF into CRLF and show every file as modified from WSL. Keep .bat/.cmd
+# as CRLF because Windows shells expect it.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

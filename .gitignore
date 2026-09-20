@@ -1,0 +1,9 @@
+# Dependencies are resolved by the OpenCode runtime; this plugin must not
+# install its own.
+node_modules/
+
+# Editor and OS noise.
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
