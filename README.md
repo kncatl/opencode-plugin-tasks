@@ -9,6 +9,25 @@
 
 两侧共用同一套 shell API，不会互相干扰。
 
+## 安装
+
+这是 OpenCode v2 的本地目录插件：把目录放进插件目录即可自动加载。
+
+```bash
+git clone https://github.com/kncatl/opencode-plugin-tasks.git \
+  ~/.config/opencode/plugins/tasks
+```
+
+若仓库与插件目录分开（例如仓库放在 Windows 盘、由 WSL 的 OpenCode 使用），
+用符号链接让插件目录指向仓库：
+
+```bash
+ln -s /path/to/opencode-plugin-tasks ~/.config/opencode/plugins/tasks
+```
+
+依赖（`@opencode/plugin/tui`、`@opentui/*`、`solid-js`）由 OpenCode 运行时解析，
+无需安装 `node_modules`。`opencode plugin list` 应显示 `tasks  local`。
+
 \---
 
 ## 一、终端侧
@@ -181,6 +200,7 @@ shell 工具派生的任务。终端侧用持久存储保留最近 30 条、展�
 ```
 index.ts   # 服务端入口：task 工具
 tui.tsx    # CLI 插件：侧栏板块 + /tasks 弹窗
+reload.sh  # 手动触发插件重载（仓库在 /mnt/c 等 Windows 盘时用）
 ```
 
 依赖由 OpenCode 运行时代为解析（`@opencode/plugin/tui`、`@opentui/\*`、`solid-js`），
@@ -188,7 +208,17 @@ tui.tsx    # CLI 插件：侧栏板块 + /tasks 弹窗
 
 ## 六、刷新
 
-编辑任一文件后保存，OpenCode 会自动重新加载插件，无需重启。
+在 Linux 文件系统上编辑任一文件后保存，OpenCode 会自动重新加载插件，无需重启。
+
+**仓库位于 Windows 盘时不会自动重载**：WSL 不向 inotify 传递 `/mnt/c`（drvfs/9p）上的
+变更，编辑不会触发 OpenCode 的文件监视。此时运行仓库内的 `reload.sh` 手动触发一次扫描：
+
+```bash
+bash /mnt/c/ntc/opencode/opencode_plugins/tasks/reload.sh
+```
+
+脚本的做法是在插件目录（ext4）里创建再删除一个探针文件；那次目录变更会触发重扫，
+而重扫会顺着符号链接读到本仓库的最新内容。
 
 ## 七、终止任务时的行为
 
