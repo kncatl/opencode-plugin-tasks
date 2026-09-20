@@ -69,6 +69,28 @@ function readRegistration(ctx) {
   return undefined
 }
 
+// --- location scoping -------------------------------------------------------
+//
+// Shell endpoints are location scoped. The server takes the location from the
+// `x-opencode-directory` header (what the generated client sends) and also
+// accepts it as a deepObject `location[directory]` query parameter. A plain
+// `directory` parameter does nothing: the request then falls back to the
+// server's own working directory, which makes a registry that does track the
+// task look empty. All three forms are sent so the call keeps working across
+// v2 builds; an unrecognised parameter is ignored.
+
+function withLocation(path, directory) {
+  if (typeof directory !== "string" || directory.length === 0) return path
+  const encoded = encodeURIComponent(directory)
+  const separator = path.includes("?") ? "&" : "?"
+  return `${path}${separator}location[directory]=${encoded}&directory=${encoded}`
+}
+
+function locationHeaders(directory) {
+  if (typeof directory !== "string" || directory.length === 0) return {}
+  return { "x-opencode-directory": encodeURIComponent(directory) }
+}
+
 // --- formatting -------------------------------------------------------------
 
 function flatten(value, limit) {
@@ -126,12 +148,54 @@ function isAlive(pid) {
 }
 
 /**
+ * Match a process command line against the command string the task reported.
+ * The server spawns `<shell> -c <command>` in its own session, but a shell that
+ * can replace itself with a simple command leaves that command's own argv
+ * behind (`sleep 240` instead of `bash -c sleep 240`), so both shapes count.
+ * The shell consumes quoting before it execs, so one more comparison with
+ * quotes removed catches those cases.
+ */
+function matchesCommand(parts, command) {
+  if (parts.length >= 3 && parts[1] === "-c" && parts[2] === command) return true
+  if (parts.length === 0) return false
+  const joined = parts.join(" ")
+  if (joined === command) return true
+  const unquoted = (text) => text.replace(/["']/g, "")
+  return unquoted(joined) === unquoted(command)
+}
+
+/**
+ * Verify that a pid the server or the event stream reported still belongs to
+ * the task: it must still be its own process-group and session leader, and it
+ * must not predate the task's start time.
+ */
+function verifiedProcessGroup(pid, startedAt) {
+  if (!Number.isFinite(pid) || pid <= 0) return undefined
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+    // "pid (comm) state ppid pgrp session ..."; comm may contain spaces or
+    // parentheses, so parse from the closing one.
+    const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
+    if (Number(tail[2]) !== pid || Number(tail[3]) !== pid) return undefined
+    if (Number.isFinite(startedAt) && statSync(`/proc/${pid}`).ctimeMs < startedAt - 5000) return undefined
+    return pid
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Locate the process group of a task the server no longer tracks, so a kill
  * still reaches the whole command tree. Tasks are spawned as their own session
- * and process-group leaders, and the created event carries the exact command,
- * so the match below is specific rather than heuristic.
+ * and process-group leaders, so a known pid is verified directly and otherwise
+ * /proc is scanned for a single group leader running the task's command.
+ *
+ * /proc only exists on Linux; elsewhere this returns undefined and the caller
+ * reports the command instead of guessing.
  */
-function taskProcessGroup(command, startedAt) {
+function taskProcessGroup(command, startedAt, pid) {
+  const known = verifiedProcessGroup(pid, startedAt)
+  if (known) return known
   if (typeof command !== "string" || command.length === 0) return undefined
   let names
   try {
@@ -141,40 +205,18 @@ function taskProcessGroup(command, startedAt) {
   }
   const matches = []
   for (const name of names) {
-    const pid = Number(name)
-    if (!Number.isInteger(pid) || pid <= 0) continue
+    const candidate = Number(name)
+    if (!Number.isInteger(candidate) || candidate <= 0) continue
 
     let parts
     try {
-      parts = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean)
+      parts = readFileSync(`/proc/${candidate}/cmdline`, "utf8").split("\0").filter(Boolean)
     } catch {
       continue // process vanished or is not readable
     }
-    // Spawned as `<shell> -c <command>`.
-    if (parts.length < 3 || parts[1] !== "-c" || parts[2] !== command) continue
-
-    let stat
-    try {
-      stat = readFileSync(`/proc/${pid}/stat`, "utf8")
-    } catch {
-      continue
-    }
-    // "pid (comm) state ppid pgrp session ..."; comm may contain spaces or
-    // parentheses, so parse from the closing one.
-    const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-    const pgrp = Number(tail[2])
-    const session = Number(tail[3])
-    if (pgrp !== pid || session !== pid) continue
-
-    // Reject an older run of the same command.
-    if (Number.isFinite(startedAt)) {
-      try {
-        if (statSync(`/proc/${pid}`).ctimeMs < startedAt - 5000) continue
-      } catch {
-        continue
-      }
-    }
-    matches.push(pid)
+    if (!matchesCommand(parts, command)) continue
+    if (verifiedProcessGroup(candidate, startedAt) === undefined) continue
+    matches.push(candidate)
   }
   return matches.length === 1 ? matches[0] : undefined
 }
@@ -338,11 +380,15 @@ export default {
       }
     }
 
-    const call = async (path, init) => {
+    const call = async (path, init, directory) => {
       const attempt = async (current) => {
-        const response = await fetch(`${current.url}${path}`, {
+        const response = await fetch(`${current.url}${withLocation(path, directory)}`, {
           ...init,
-          headers: { authorization: bearer(current.password), ...(init?.headers ?? {}) },
+          headers: {
+            authorization: bearer(current.password),
+            ...locationHeaders(directory),
+            ...(init?.headers ?? {}),
+          },
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         })
         if (response.status === 404) {
@@ -377,13 +423,12 @@ export default {
     }
 
     const getTask = async (taskID, directory) => {
-      const result = await call(
-        `/api/shell/${encodeURIComponent(taskID)}?directory=${encodeURIComponent(directory)}`,
-        undefined,
-      ).catch((error) => {
-        if (error?.notFound) return undefined
-        throw error
-      })
+      const result = await call(`/api/shell/${encodeURIComponent(taskID)}`, undefined, directory).catch(
+        (error) => {
+          if (error?.notFound) return undefined
+          throw error
+        },
+      )
       if (result?.data) remember(result.data)
       return result?.data
     }
@@ -596,7 +641,7 @@ export default {
           const location = { directory }
 
           if (input.action === "list") {
-            const result = await call(`/api/shell?directory=${encodeURIComponent(directory)}`)
+            const result = await call(`/api/shell`, undefined, directory)
             const tasks = [...(result?.data ?? [])]
             // The server's registry does not include tasks spawned by the
             // shell tool, so fold in whatever the event stream reported as
@@ -660,7 +705,9 @@ export default {
             // a running task is the common case, and its early output is the
             // least interesting part.
             const probe = await call(
-              `/api/shell/${encodeURIComponent(taskID)}/output?directory=${encodeURIComponent(directory)}&cursor=${Number.MAX_SAFE_INTEGER}&limit=1`,
+              `/api/shell/${encodeURIComponent(taskID)}/output?cursor=${Number.MAX_SAFE_INTEGER}&limit=1`,
+              undefined,
+              directory,
             ).catch((error) => {
               if (error?.notFound) return undefined
               throw error
@@ -704,7 +751,9 @@ export default {
               }
             } else {
               const result = await call(
-                `/api/shell/${encodeURIComponent(taskID)}/output?directory=${encodeURIComponent(directory)}&cursor=${cursor}&limit=${limit}`,
+                `/api/shell/${encodeURIComponent(taskID)}/output?cursor=${cursor}&limit=${limit}`,
+                undefined,
+                directory,
               ).catch((error) => {
                 if (error?.notFound) return undefined
                 throw error
@@ -753,7 +802,7 @@ export default {
               if (!candidate || candidate.status !== "running") {
                 return { content: missingTaskMessage(taskID, directory, candidate, findRetainedLog(taskID)) }
               }
-              const pgrp = taskProcessGroup(candidate.command, candidate.time?.started)
+              const pgrp = taskProcessGroup(candidate.command, candidate.time?.started, candidate.pid)
               if (!pgrp) {
                 return {
                   content:
@@ -792,9 +841,7 @@ export default {
           // Record the kill before it happens: the completion watcher can
           // enqueue its notification before `shell.deleted` reaches us.
           markKilled(taskID)
-          await call(`/api/shell/${encodeURIComponent(taskID)}?directory=${encodeURIComponent(directory)}`, {
-            method: "DELETE",
-          })
+          await call(`/api/shell/${encodeURIComponent(taskID)}`, { method: "DELETE" }, directory)
           return {
             content: `Terminated ${taskID} (${flatten(before.command, DESCRIPTION_LIMIT)}). Completion notice suppressed (best effort).`,
             metadata: { taskID, command: before.command },

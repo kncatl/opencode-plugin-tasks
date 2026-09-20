@@ -73,10 +73,16 @@ ln -s /path/to/opencode-plugin-tasks ~/.config/opencode/plugins/tasks
 **不要**用 `sleep`、轮询或类似命令阻塞会话等待任务。`task` 工具和 shell 工具的描述里都
 写入了这条提醒，防止后续模型再主动执行等待。
 
-### 任务记录消失后的兜底（重要）
+### 服务端记录与本地索引（重要）
 
-服务端的 shell 注册表**不包含 shell 工具派生的任务**（`GET /api/shell` 对它恒返回空）。
-这意味着插件不能依赖服务端列表，改用两条自有数据源：
+shell 端点都是 **location 作用域**的。服务端从 `x-opencode-directory` 头（生成客户端的
+做法）或 deepObject 查询参数 `location[directory]` 取位置；传普通的 `?directory=` 是
+**无效参数**，服务端会回落到自己的工作目录，此时注册表看起来是空的、任务看起来"从未被登记"。
+插件两种形式都发（`withLocation()` / `locationHeaders()`）。
+
+位置正确时，`GET /api/shell` **确实**会列出 shell 工具派生的运行中任务，
+`GET /api/shell/{id}` 返回完整记录（含 `pid`、`cwd`、`shell`、日志路径）。插件仍自建
+索引，但理由变成"服务端记录在任务退出时立即丢弃"，而不是"注册表不含这类任务"：
 
 1. **事件流**：订阅 `shell.created` / `shell.exited`，在任务**启动时**就记下
    命令、cwd、日志路径、会话与起始时间，而不是等某次工具调用才记录。
@@ -100,18 +106,25 @@ The retained log still holds the output: call 'output' to page through it, ...
 `output` 会自动回退到该文件，分页语义与服务端一致，并注明
 `Paged from the retained log`。
 
-`list` 同样合并自事件流：保留 `status: running` 且 pid 仍存活（或事件未带 pid）的条目。
+`list` 以服务端注册表为主，再合并事件流中仍在运行、但服务端已丢弃记录的条目
+（保留 `status: running` 且 pid 仍存活，或事件未带 pid 的条目）。
 
 ### kill 的兜底
 
-服务端 `DELETE /api/shell/{id}` 对不在注册表中的任务返回 204 但**什么都不做**。
-因此当服务端查不到任务时，插件改用进程组：
+正常情况下 `task kill` 直接调用 `DELETE /api/shell/{id}`，由服务端终止任务
+（Windows 上服务端用 `taskkill /pid <pid> /T /F` 终止整棵进程树）。只有当服务端
+**已经没有该任务的记录**而插件仍认为它在运行时，才走进程组兜底：
 
 * 任务由服务端以 `<shell> -c <command>` 形式派生，且**自成一个进程组/会话**
   （`pgrp == session == pid`）。
-* 通过 `/proc/<pid>/stat` 校验这两个条件，并用 `/proc/<pid>/cmdline` 精确匹配命令串，
-  再用起始时间排除同名旧进程，只有**唯一匹配**时才发信号。
+* 若事件或服务端给了 `pid`，先用 `/proc/<pid>/stat` 校验它仍是进程组/会话首领，
+  并用起始时间排除同名旧进程；没有 pid 时退化为扫描 `/proc`，要求命令唯一匹配。
+* 匹配命令时同时接受 `<shell> -c <command>` 与 shell 优化后 exec 出来的直接命令行
+  （如 `sleep 240`），不会因为 shell 的 exec 优化而漏杀。
 * `kill(-pgrp, SIGTERM)` 终止整棵命令树，与正常 kill 一样尽力拦截完成通知。
+
+这套兜底依赖 `/proc`，**仅 Linux 可用**；其他平台在此情形下不会误杀，而是报告命令原文
+让调用方自行处理（见"跨平台可用性"）。
 
 匹配不唯一或找不到时不会误杀，而是报告命令原文让调用方自行处理。
 
@@ -146,7 +159,8 @@ AI 随时可以读取**正在运行**的任务日志，读取本身不会干扰�
 
 1. 从 `$XDG\_STATE\_HOME/opencode/service.json`（非 latest 通道为 `service-<channel>.json`）
 读取服务 URL 与密码。
-2. 用 `Basic opencode:<password>` 调用 `/api/shell\*` 端点。
+2. 用 `Basic opencode:<password>` 调用 `/api/shell\*` 端点，并始终带上 location
+   （`x-opencode-directory` 头 + `location[directory]` 查询参数，两种形式都发）。
 3. **身份校验**：插件运行在服务进程内，因此比对 `GET /api/info` 返回的 `pid` 与
 `process.pid`。不一致（例如运行在 `--standalone` 私有服务器中）时拒绝操作，
 避免误管另一个服务器的任务。
@@ -155,23 +169,41 @@ AI 随时可以读取**正在运行**的任务日志，读取本身不会干扰�
 日志与退出码来自服务端记录；记录被清理后，工具会退回显示最近一次观察到的
 状态和保留的日志文件路径。
 
-### 实现要点：为什么必须自建索引
+### 已知的现象与限制
 
-服务端 `/api/shell` 路由的语义是"当前运行中的 shell 命令"，但 **shell 工具派生的任务
-不登记在其中**（`GET /api/shell` 恒为空，`GET /api/shell/{id}` 恒 404）。插件的
-`list` / `status` / `output` / `kill` 因此都不能以该接口为准，而是以
-**事件流 + 磁盘日志 + /proc** 三条自有数据源为主，HTTP 接口只在恰好命中时使用。
-
-已知的现象与限制：
-
-* 服务端 `DELETE /api/shell/{id}` 对未登记任务返回 `204 No Content` 但无副作用，
-  所以不能靠响应码判断终止是否成功。
 * 事件会**重复投递**（同一 `shell.created` 可能出现多次）；`remember()` 用同一 id
   覆盖写入，因此重复是幂等的。
 * `shell.created` 携带的 `Shell.Info` **可能没有 `pid`**，所以"无 pid"不能当作
   "进程已死"，`list` 只在 pid 存在时才做存活校验。
 * 日志目录名是对 location 的哈希，不可从目录字符串反推；插件按 taskID 遍历各
   location 子目录精确匹配文件名来定位。
+* 服务端记录在任务退出时立即丢弃，且 `DELETE` 对已消失的记录仍是 `204`，
+  所以不能靠响应码判断终止是否成功——插件的 `markKilled()` 在发请求前就记账。
+
+\---
+
+## 二·五、跨平台可用性
+
+|能力|Linux|Windows|macOS|
+|-|-|-|-|
+|`list` / `status` / `output`|✅|✅|✅|
+|已退出任务的日志分页（磁盘回退）|✅|✅|✅|
+|`kill`（服务端主路径）|✅|✅（服务端走 `taskkill /T /F`）|✅|
+|`kill` 进程组兜底（服务端已丢记录时）|✅ `/proc`|❌ 报告命令原文|❌ 报告命令原文|
+|侧栏面板与 `/tasks` 弹窗|✅|✅|✅|
+
+要点：
+
+* **路径**：OpenCode 在所有平台都用 homedir 下的 XDG 风格目录
+  （`~/.local/share`、`~/.local/state`），插件对这一点的假设与 OpenCode 自身一致，
+  Windows 上无需翻译成 `%LOCALAPPDATA%`。
+* **进程兜底**：`/proc` 扫描与 `kill(-pgrp, SIGTERM)` 只在 Linux 存在。Windows/macOS
+  上该路径直接判定为"无法识别"，不会误杀；由于服务端主路径正常，这只影响
+  "记录已被清理但进程仍在跑"的边缘情形。
+* **shell 派生形式**：Linux 的 bash 会把简单命令 exec 优化掉，`/proc` 里看到的是
+  `sleep 240` 而不是 `bash -c 'sleep 240'`；匹配逻辑两种都接受。Windows 的
+  cmd/PowerShell 不做这种替换，且该路径本就不执行。
+* **服务端记录本身跨平台一致**：`GET /api/shell` 是普通 HTTP + JSON，与宿主平台无关。
 
 \---
 
@@ -276,3 +308,15 @@ bash /mnt/c/ntc/opencode/opencode_plugins/tasks/reload.sh
 * `/tasks` 弹窗内容异常变长：弹窗宿主只限制宽度，高度需要插件自己约束。列表与输出框
   已按终端高度分配行数并各自滚动；若仍溢出，检查 `tui.tsx` 中的 `DIALOG_CHROME_ROWS`
   余量是否被新增的固定内容行吃掉。
+* `status` / `kill` 总是报 "no longer known to the server" 而任务明明在跑：
+  先确认插件发出的 location 正确（`x-opencode-directory` 头 + `location[directory]`）。
+  `?directory=` 不是有效参数，服务端会静默回落到自己的工作目录，注册表因此看起来是空的。
+  这是 v2.0.8 之后最容易被误判为"上游不支持"的现象。
+* 想确认服务端到底登记了什么（用真实 HTTP 复现）：
+
+  ```bash
+  URL=$(python3 -c "import json;print(json.load(open('$HOME/.local/state/opencode/service.json'))['url'])")
+  PASS=$(python3 -c "import json;print(json.load(open('$HOME/.local/state/opencode/service.json'))['password'])")
+  curl -s -u "opencode:$PASS" -H "x-opencode-directory: $(python3 -c "import urllib.parse;print(urllib.parse.quote('$PWD',safe=''))")" \
+    "$URL/api/shell" | head -c 400
+  ```
