@@ -5,7 +5,7 @@
 |侧|入口|面向|
 |-|-|-|
 |终端|会话侧栏的 Tasks 板块、`/tasks` 弹窗|人|
-|服务端|`task` 工具（list / status / output / kill）|模型|
+|服务端|`tasks` 工具（list / status / output / kill）|模型|
 
 两侧共用同一套 shell API，不会互相干扰。
 
@@ -61,7 +61,7 @@ ln -s /path/to/opencode-plugin-tasks ~/.config/opencode/plugins/tasks
 
 ## 二、服务端工具
 
-模型在会话中可以直接调用 `task` 工具：
+模型在会话中可以直接调用 `tasks` 工具：
 
 |action|说明|必填|
 |-|-|-|
@@ -72,11 +72,17 @@ ln -s /path/to/opencode-plugin-tasks ~/.config/opencode/plugins/tasks
 
 `list` 可传 `scope: "location"` 查看整个工作目录下的任务。
 
+> **工具名为什么是 `tasks` 而不是 `task`**：v2 的 TUI 有一张遗留工具名别名表
+> （`bash→shell`、`task→subagent`、`apply_patch→patch`）。名为 `task` 的自定义工具
+> 会被渲染成子代理委派卡，而那张卡以 `input.description` 判断完成，本工具没有该字段，
+> 于是会永远停在 `Delegating…` 并持续显示处理动画。把工具命名为 `tasks` 即归类为
+> 普通工具卡（运行时显示工具名，完成后显示 ✓ 与摘要）。
+
 ### 完成后自动唤醒（不要 sleep）
 
 后台任务结束时，shell 工具会把完成通知作为一条合成会话消息投递；会话即使已经空闲，
 也会被这条通知**自动恢复一次执行**，把结果送达模型。因此启动后台任务后直接结束回合即可，
-**不要**用 `sleep`、轮询或类似命令阻塞会话等待任务。`task` 工具和 shell 工具的描述里都
+**不要**用 `sleep`、轮询或类似命令阻塞会话等待任务。`tasks` 工具和 shell 工具的描述里都
 写入了这条提醒，防止后续模型再主动执行等待。
 
 ### 服务端记录与本地索引（重要）
@@ -117,7 +123,7 @@ The retained log still holds the output: call 'output' to page through it, ...
 
 ### kill 的兜底
 
-正常情况下 `task kill` 直接调用 `DELETE /api/shell/{id}`，由服务端终止任务
+正常情况下 `tasks kill` 直接调用 `DELETE /api/shell/{id}`，由服务端终止任务
 （Windows 上服务端用 `taskkill /pid <pid> /T /F` 终止整棵进程树）。只有当服务端
 **已经没有该任务的记录**而插件仍认为它在运行时，才走进程组兜底：
 
@@ -140,7 +146,7 @@ AI 随时可以读取**正在运行**的任务日志，读取本身不会干扰�
 
 |方式|能力|适用|
 |-|-|-|
-|`task` → `output`|字节游标分页，**默认读最新输出**|判断"现在进展如何"|
+|`tasks` → `output`|字节游标分页，**默认读最新输出**|判断"现在进展如何"|
 |`read` 工具读日志文件|行号、offset/limit、分页|已知要看哪一段|
 |`grep` 工具搜日志文件|正则匹配|大日志中找错误/关键字|
 
@@ -240,7 +246,7 @@ shell 工具派生的任务。终端侧用持久存储保留最近 30 条、展�
 ## 五、结构
 
 ```
-index.ts   # 服务端入口：task 工具
+index.ts   # 服务端入口：tasks 工具
 tui.tsx    # CLI 插件：侧栏板块 + /tasks 弹窗
 reload.sh  # 手动触发插件重载（仓库在 /mnt/c 等 Windows 盘时用）
 ```
@@ -267,7 +273,7 @@ bash /mnt/c/ntc/opencode/opencode_plugins/tasks/reload.sh
 终止任务分两种情况，行为刻意不同：
 
 **用户主动终止**（`/tasks` 弹窗按 `x` → `y`、内置 Shell 标签页 `ctrl+d`、或 AI 调用
-`task kill`）：服务端插件会尽力在完成通知送达前把它取消，通常不会唤醒 AI。
+`tasks kill`）：服务端插件会尽力在完成通知送达前把它取消，通常不会唤醒 AI。
 这是**尽力而为**的拦截，存在已知竞态窗口（见下），并非 100% 可靠。终止记录写在两处：
 
 * 终端侧：`\~/.local/state/opencode/latest/tui/plugin.tasks.history.json`，
@@ -322,6 +328,9 @@ bash /mnt/c/ntc/opencode/opencode_plugins/tasks/reload.sh
   （新输出没有自己的事件）。若标题出现 `unable to read; retrying…` 说明请求在重试；
   若很快变成 `retained log`，说明服务端记录已被删除，视图已切换到磁盘日志——两者都是
   正常状态而非故障。
+* AI 的工具卡片显示成 `Delegating…` 且处理动画不消失：这是工具命名撞上了 TUI 的遗留
+  别名（`task→subagent`，见第二节注）。确认工具注册名是 `tasks`；若改回了 `task`，
+  卡片就会一直停在子代理委派形态——只是显示问题，kill 等功能本身正常。
 * `status` / `kill` 总是报 "no longer known to the server" 而任务明明在跑：
   先确认插件发出的 location 正确（`x-opencode-directory` 头 + `location[directory]`）。
   `?directory=` 不是有效参数，服务端会静默回落到自己的工作目录，注册表因此看起来是空的。

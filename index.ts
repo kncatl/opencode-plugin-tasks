@@ -34,7 +34,7 @@ const SHELL_GONE = /Shell\.NotFoundError|Shell command not found/i
 /**
  * A background task's completion notice is delivered as a message that resumes
  * an idle session, so a model must not keep the turn alive with sleep/poll
- * loops. The note goes into the task tool description and is also appended to
+ * loops. The note goes into the tasks tool description and is also appended to
  * the shell tool description, where background tasks are started.
  */
 const WAKE_NOTE =
@@ -582,7 +582,10 @@ export default {
 
     await ctx.tool.transform((editor) => {
       editor.add({
-        name: "task",
+        // Named "tasks" (plural) on purpose: the TUI maps the legacy tool name
+        // "task" to its subagent delegation card, which waits for an input
+        // field this tool does not have and therefore never shows as finished.
+        name: "tasks",
         // Keep the shell tool's own output in charge of foreground results.
         options: { codemode: false },
         description: [

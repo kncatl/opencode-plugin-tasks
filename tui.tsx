@@ -67,7 +67,7 @@ const GLYPH = {
 /**
  * A task removed from the shell registry while the shell tool is still waiting
  * for it makes the tool report `Shell.NotFoundError`. That happens when a kill
- * is performed from outside the task (the Tasks dialog, the AI's task tool):
+ * is performed from outside the task (the Tasks dialog, the AI's tasks tool):
  * the registry entry disappears and the tool has nothing left to read.
  *
  * Normally the server plugin cancels the completion notice before it is
