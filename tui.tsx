@@ -26,14 +26,21 @@
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import { useTerminalDimensions } from "@opentui/solid"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { closeSync, fstatSync, openSync, readSync } from "node:fs"
 
 const SIDEBAR_LIMIT = 4
 const HISTORY_LIMIT = 10
 const HISTORY_KEEP = 30
 const TAIL_CHARS = 2000
 const MAX_TREE_SESSIONS = 12
-const OUTPUT_LIMIT = 32768
+/**
+ * Bytes kept in the output view. The first read takes the tail, so a long log
+ * shows its newest output rather than its oldest; later reads append and trim.
+ */
+const OUTPUT_LIMIT = 65536
 const OUTPUT_LINES = 200
+/** Poll interval once the output stream has caught up with a running task. */
+const OUTPUT_POLL_MS = 1000
 const MAX_TREE_DEPTH = 32
 
 /**
@@ -70,6 +77,15 @@ const GLYPH = {
  * by the same text.
  */
 const SHELL_GONE = /Shell\.NotFoundError|Shell command not found/i
+
+/**
+ * The generated client tags a missing task record with `_tag`; the server
+ * plugin's own HTTP wrapper uses `notFound`. Either one means the record is
+ * gone, not that the connection failed.
+ */
+function isNotFound(error) {
+  return error?._tag === "ShellNotFoundError" || error?.notFound === true
+}
 
 function isKillNotice(message) {
   return message?.metadata?.state === "error" && SHELL_GONE.test(String(message?.text ?? ""))
@@ -363,6 +379,39 @@ function combine(live, history) {
   return [...live.map(asTask), ...finished]
 }
 
+/**
+ * Read a task's retained log. The shell service keeps the captured output at
+ * `info.file` after the server drops the task record, so the view can still
+ * show it: with a byte cursor it appends what was written after the last
+ * served read, otherwise it shows the last OUTPUT_LIMIT bytes. Returns
+ * undefined when the file cannot be read at all.
+ */
+function readRetainedOutput(file, cursor) {
+  if (typeof file !== "string" || file.length === 0) return undefined
+  try {
+    const handle = openSync(file, "r")
+    try {
+      const size = fstatSync(handle).size
+      const start =
+        typeof cursor === "number" && cursor >= 0
+          ? Math.min(cursor, size)
+          : Math.max(0, size - OUTPUT_LIMIT)
+      // Never read more than one window, even if the gap since the last served
+      // read grew large: the view only keeps the tail anyway.
+      const from = Math.max(start, size - OUTPUT_LIMIT)
+      const length = size - from
+      if (length <= 0) return { text: "", size }
+      const buffer = Buffer.allocUnsafe(length)
+      const read = readSync(handle, buffer, 0, length, from)
+      return { text: buffer.subarray(0, read).toString("utf8"), size }
+    } finally {
+      closeSync(handle)
+    }
+  } catch {
+    return undefined
+  }
+}
+
 function TasksSidebar(props) {
   const context = usePlugin()
   const store = useShellTasks(context, () => props.sessionID)
@@ -652,34 +701,133 @@ function TasksApp(props) {
       return Math.min(max, Math.max(0, current + delta))
     })
 
-  const loadOutput = async () => {
-    const task = selected()
-    if (!task) return
+  // --- output stream -------------------------------------------------------
+  //
+  // The view follows the selected task instead of loading a one-shot snapshot.
+  // New output has no event of its own (shell events only announce creation
+  // and exit), so the stream polls: read from the current byte cursor,
+  // continue immediately while a backlog remains, and wait a second once
+  // caught up — the same shape the built-in shell viewer uses.
+  //
+  // When the task exits the server drops its record and the endpoint starts
+  // answering 404. The captured log stays on disk, so the stream switches to
+  // that file and stops polling; the same file serves tasks whose record was
+  // gone long before the view was opened.
+
+  let stream
+
+  const stopStream = () => {
+    if (stream?.timer !== undefined) clearTimeout(stream.timer)
+    stream = undefined
+  }
+
+  const appendChunk = (chunk) => {
+    if (chunk.length === 0) return
+    const merged = stream.buffer + chunk
+    if (merged.length > OUTPUT_LIMIT) stream.trimmed = true
+    stream.buffer = merged.slice(-OUTPUT_LIMIT)
+    setOutput(stream.buffer)
+  }
+
+  const refreshOutputLabel = (retained) => {
+    const window = stream.trimmed ? ` · last ${Math.round(OUTPUT_LIMIT / 1024)} KB` : ""
+    setOutputLabel(`output · ${stream.size} bytes${window}${retained ? " · retained log" : ""}`)
+  }
+
+  const finishStream = () => {
+    if (stream.timer !== undefined) {
+      clearTimeout(stream.timer)
+      stream.timer = undefined
+    }
+    const retained = readRetainedOutput(stream.file, stream.cursor >= 0 ? stream.cursor : undefined)
+    if (retained) {
+      appendChunk(retained.text)
+      stream.size = Math.max(stream.size, retained.size)
+      refreshOutputLabel(true)
+      return
+    }
+    if (stream.buffer.length > 0) {
+      refreshOutputLabel(false)
+      return
+    }
+    // Nothing on disk either: the notice tail is all that is left.
+    if (stream.tail) {
+      setOutput(stream.tail)
+      setOutputLabel("output · from completion notice (tail)")
+      return
+    }
+    setOutput("Output is no longer available for this task.")
+    setOutputLabel("output")
+  }
+
+  const streamStep = async (id, location) => {
+    const current = stream
+    if (!current || current.id !== id) return
     try {
+      if (current.cursor < 0) {
+        // Learn the size first, then start from the tail window.
+        const probe = await context.client.shell.output({
+          id,
+          location,
+          cursor: Number.MAX_SAFE_INTEGER,
+          limit: 1,
+        })
+        if (stream !== current) return
+        current.size = typeof probe.data?.size === "number" ? probe.data.size : 0
+        current.cursor = Math.max(0, current.size - OUTPUT_LIMIT)
+      }
+      const before = current.cursor
       const result = await context.client.shell.output({
-        id: task.id,
-        location: store.location(),
-        cursor: 0,
+        id,
+        location,
+        cursor: current.cursor,
         limit: OUTPUT_LIMIT,
       })
-      setOutput(result.data.output ?? "")
-      setOutputLabel(
-        `output · ${result.data.size} bytes${result.data.truncated ? " (truncated)" : ""}`,
-      )
-      return
-    } catch {
-      // The record is gone; fall back to the notification tail, then the file.
-      if (task.tail) {
-        setOutput(task.tail)
-        setOutputLabel("output · from completion notice (tail)")
-      } else if (task.file) {
-        setOutput(`Output is no longer served by the server.\nRetained output: ${task.file}`)
-        setOutputLabel("output")
-      } else {
-        setOutput("Output is no longer available for this task.")
-        setOutputLabel("output")
+      if (stream !== current) return
+      const data = result.data ?? {}
+      if (typeof data.size === "number") current.size = data.size
+      if (typeof data.cursor === "number") current.cursor = data.cursor
+      appendChunk(typeof data.output === "string" ? data.output : "")
+      refreshOutputLabel(false)
+
+      const caughtUp = current.cursor >= current.size
+      const live = context.data.shell.get(id)
+      if (caughtUp && live !== undefined && live.status !== "running") {
+        finishStream()
+        return
       }
+      current.timer = setTimeout(
+        () => void streamStep(id, location),
+        caughtUp || current.cursor <= before ? OUTPUT_POLL_MS : 0,
+      )
+    } catch (error) {
+      if (stream !== current) return
+      if (isNotFound(error)) {
+        finishStream()
+        return
+      }
+      // Transient failure: keep what is displayed and retry.
+      setOutputLabel("output · unable to read; retrying…")
+      current.timer = setTimeout(() => void streamStep(id, location), OUTPUT_POLL_MS)
     }
+  }
+
+  const startStream = (task, location) => {
+    if (stream?.id === task.id) return
+    stopStream()
+    stream = {
+      id: task.id,
+      cursor: -1,
+      size: 0,
+      buffer: "",
+      trimmed: false,
+      timer: undefined,
+      file: task.file,
+      tail: task.tail,
+    }
+    setOutput(undefined)
+    setOutputLabel("output · loading…")
+    void streamStep(task.id, location)
   }
 
   const toggleOutput = () => {
@@ -738,13 +886,30 @@ function TasksApp(props) {
 
   const refresh = () => {
     store.refresh()
-    if (outputOpen()) void loadOutput()
+    if (outputOpen()) {
+      const task = selected()
+      if (task) {
+        // Restart the stream so a manual refresh re-reads the tail window.
+        stopStream()
+        startStream(task, store.location())
+      }
+    }
   }
 
+  // One live stream for the selected task while the output view is open. The
+  // stream restarts when the selection changes and stops when the view closes;
+  // new output does not re-run this effect because the stream polls on its own.
   createEffect(() => {
-    const id = selected()?.id
-    if (open() && outputOpen() && id) void loadOutput()
+    const task = open() && outputOpen() ? selected() : undefined
+    const location = store.location()
+    if (!task) {
+      stopStream()
+      return
+    }
+    startStream(task, location)
   })
+
+  onCleanup(stopStream)
 
   const outputTail = createMemo(() => {
     const raw = output()
